@@ -1,0 +1,13 @@
+{
+  "name": "hive-zero-v1",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Autonomous zero-capital opportunity research hive with public EVM wallet monitoring.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
