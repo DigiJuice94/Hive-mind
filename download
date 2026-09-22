@@ -1,0 +1,4 @@
+node_modules/
+hive-audit-data/
+.env
+*.log
