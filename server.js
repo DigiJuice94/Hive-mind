@@ -13,6 +13,8 @@ const REPAIR_COOLDOWN_MS = Math.max(60 * 60 * 1000, Number(process.env.HIVE_REPA
 const MAX_FINDINGS = 250;
 const MAX_ACTIVITY = 300;
 const MAX_UPDATES = 30;
+const MAX_LESSONS = 160;
+const MAX_PROMPTS = 40;
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(path.join(DATA_DIR, "updates"), { recursive: true });
@@ -34,9 +36,100 @@ const REPAIR_MAP = {
   EXIT_PENDING_STUCK: ["position-manager.ts", "position-store.ts", "sellability-auditor.ts", "types.ts"],
 };
 
+
+const PROMPT_PROFILES = {
+  UNVERIFIED_SELL_CREDIT: {
+    label: "Stop unverified PAPER sales from becoming realized cash",
+    suspectedRootCause: "The live ledger is crediting SELL proceeds when routeVerified is not true, including fills whose provider is liquidity-model. The infrastructure appears to be allowing modeled exit proceeds to reach cash/realized P&L without independently verified sell-route evidence.",
+    goal: "Repair the SELL execution/accounting boundary so a Council EXIT decision can still exist, but the PAPER wallet cannot claim realized proceeds unless the existing sellability/route-verification infrastructure has actually verified an executable exit route.",
+    acceptance: [
+      "A SELL with routeVerified !== true must not increase cashUsd, realizedPnlUsd, realized proceeds, or verified sale totals.",
+      "A liquidity-model price or modeled proceeds calculation alone must never qualify as proof of an executable SELL route.",
+      "When an EXIT is requested but a route cannot be verified, preserve the Council's EXIT decision while recording the execution as blocked/pending/unsellable using existing infrastructure semantics instead of inventing realized cash.",
+      "Successful SELL fills must persist routeVerified=true plus the provider/evidence used to verify the route.",
+      "Cash + independently marked open value - locked/unsellable capital must reconcile to reported equity after the fix.",
+      "Existing BUY/SELL/EXIT strategy decisions must remain byte-for-byte behaviorally equivalent for identical inputs; only execution verification and accounting may change."
+    ],
+    tests: [
+      "Regression: routeVerified=false + filledUsd>0 must produce $0 newly realized cash/profit.",
+      "Regression: routeVerified=true must preserve the existing successful SELL accounting path.",
+      "Regression: provider=liquidity-model without independent route proof must not be treated as a verified sale.",
+      "Regression: repeated processing of the same failed/blocked exit must not create duplicate cash or fills.",
+      "Run the Council's existing paper-wallet/equity reconciliation checks before and after the patch."
+    ]
+  },
+  ZERO_LIQUIDITY_BUY: {
+    label: "Close the zero-liquidity PAPER fill verification gap",
+    suspectedRootCause: "The live Council has recorded BUY fills whose entry snapshot has zero or invalid liquidity, which means execution/liquidity evidence is being accepted or bypassed incorrectly somewhere between the Council decision and PAPER fill/accounting.",
+    goal: "Repair the execution verification layer so a Council BUY decision is preserved, but a PAPER fill is not credited when the existing infrastructure cannot verify usable liquidity/execution evidence.",
+    acceptance: [
+      "A recorded entry snapshot with zero, negative, invalid, or explicitly unavailable liquidity cannot become a successful PAPER BUY fill.",
+      "Do not change which tokens the Council decides to BUY, WATCH, or SKIP.",
+      "A failed execution-verification check must be recorded distinctly from a strategy rejection.",
+      "No fake position value or realized/unrealized P&L may originate from an execution that never passed the existing liquidity/sellability evidence gates.",
+      "Existing valid-liquid BUY behavior must remain unchanged."
+    ],
+    tests: [
+      "Regression: zero-liquidity snapshot + BUY decision => no credited PAPER fill.",
+      "Regression: valid liquidity + identical BUY decision => existing fill path still works.",
+      "Regression: missing/invalid liquidity must fail closed rather than defaulting to tradable.",
+      "Verify that the strategy decision record remains unchanged while the execution result changes only when verification fails."
+    ]
+  },
+  ACCOUNTING_MISMATCH: {
+    label: "Repair Council equity reconciliation",
+    suspectedRootCause: "The proof feed reports a mismatch between reported equity and independently reconstructed equity, indicating that one or more cash, open-value, realized P/L, locked-capital, or state-persistence components are being double-counted, omitted, or valued inconsistently.",
+    goal: "Make reported paper-wallet totals reconcile exactly to the independently reconstructable ledger without changing any trading decision or exit/entry policy.",
+    acceptance: [
+      "Reported equity must match independently reconstructed equity within $0.01.",
+      "Realized P/L must be derived only from valid credited execution events.",
+      "Unsellable/locked capital must not remain in positive liquid mark value.",
+      "No open position may be counted twice across active/closed/unsellable state.",
+      "Trading strategy and decision outputs must remain unchanged."
+    ],
+    tests: [
+      "Reconcile cash, realized P/L, unrealized P/L, open marked value, unsellable/locked capital, and final equity from raw ledger rows.",
+      "Run duplicate-fill/idempotency regression tests.",
+      "Restart/reload persisted state and confirm the exact same reconstructed totals."
+    ]
+  },
+  UNSELLABLE_ACCOUNTING: {
+    label: "Make unsellable positions impossible to count as positive paper profit",
+    suspectedRootCause: "The live position state contains unsellable positions whose mark/locked-capital treatment is inconsistent, which can inflate equity or profit even though the position cannot be exited.",
+    goal: "Correct only the accounting/state representation of unsellable positions so blocked capital is treated consistently and cannot masquerade as liquid profit.",
+    acceptance: [
+      "Unsellable positions must not contribute positive liquid mark value after being classified unsellable.",
+      "Locked-capital loss must reconcile to remaining unrecovered cost basis.",
+      "A later verified executable SELL may move funds only through the normal verified execution path.",
+      "Do not change the Council's exit strategy or the rule that caused it to request an exit."
+    ],
+    tests: [
+      "Unsellable position with no verified exit => no positive liquid mark contribution.",
+      "Locked-capital loss equals unrecovered cost basis within cents.",
+      "Verified later recovery/SELL updates accounting exactly once."
+    ]
+  },
+  EXIT_PENDING_STUCK: {
+    label: "Repair stuck exit_pending infrastructure state",
+    suspectedRootCause: "Positions are remaining in exit_pending beyond the expected execution lifecycle, suggesting stale-state, persistence, retry, or failure-transition handling is not completing.",
+    goal: "Repair the technical state machine/retry bookkeeping so exit attempts resolve cleanly without changing why or when the Council decided to exit.",
+    acceptance: [
+      "No exit_pending position remains indefinitely because of stale technical state.",
+      "Retries must be idempotent and may not duplicate fills or proceeds.",
+      "Failure/unsellable outcomes must be explicit and auditable.",
+      "Exit strategy rules and Council decisions remain unchanged."
+    ],
+    tests: [
+      "Simulate route failure/timeouts and verify deterministic terminal/retry state.",
+      "Repeat the same retry event and confirm no duplicate fill/cash mutation.",
+      "Verify successful exit path is unchanged."
+    ]
+  }
+};
+
 function freshState() {
   return {
-    version: "HIVE-AUDITOR-V1",
+    version: "HIVE-AUDITOR-V1.2",
     startedAt: new Date().toISOString(),
     targetUrl: TARGET_URL,
     scans: 0,
@@ -46,9 +139,18 @@ function freshState() {
     findings: [],
     activity: [],
     updates: [],
+    updatePrompts: [],
     lastSnapshot: null,
     staticAuditComplete: false,
     repairBusy: false,
+    learning: {
+      initialized: false,
+      lessons: [],
+      seenFillIds: [],
+      lastLedgerSignature: null,
+      lastReconSignature: null,
+      metrics: { fillsObserved: 0, buysObserved: 0, sellsObserved: 0, verifiedSells: 0, verifiedSellRate: 0, zeroLiquidityBuys: 0, unsellablePositions: 0, lockedCapitalLossUsd: 0, endpointCoverage: 0 },
+    },
   };
 }
 
@@ -78,6 +180,218 @@ function esc(v) { return String(v ?? "").replace(/[&<>\"]/g, c => ({"&":"&amp;",
 function activity(agent, text, level="info") {
   S.activity.unshift({ at: now(), agent, text, level });
   S.activity = S.activity.slice(0, MAX_ACTIVITY);
+}
+
+
+function ensureLearning() {
+  if (!S.learning || typeof S.learning !== "object") S.learning = freshState().learning;
+  if (!Array.isArray(S.learning.lessons)) S.learning.lessons = [];
+  if (!Array.isArray(S.learning.seenFillIds)) S.learning.seenFillIds = [];
+  if (!S.learning.metrics || typeof S.learning.metrics !== "object") S.learning.metrics = freshState().learning.metrics;
+  return S.learning;
+}
+
+function learn(input) {
+  const L = ensureLearning();
+  const evidence = String(input.evidence || "");
+  const key = input.key || `${input.kind || "OBSERVATION"}:${hash(`${input.title}|${evidence}`)}`;
+  const existing = L.lessons.find(x => x.key === key);
+  if (existing) {
+    existing.lastSeenAt = now();
+    existing.count = (existing.count || 1) + 1;
+    existing.evidence = evidence;
+    existing.confidence = input.confidence || existing.confidence || "observed";
+    return existing;
+  }
+  const row = {
+    id: `L-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString("hex").toUpperCase()}`,
+    key,
+    kind: input.kind || "OBSERVATION",
+    title: String(input.title || "Council observation"),
+    evidence,
+    source: input.source || "live-council",
+    confidence: input.confidence || "observed",
+    firstSeenAt: now(),
+    lastSeenAt: now(),
+    count: 1,
+  };
+  L.lessons.unshift(row);
+  L.lessons = L.lessons.slice(0, MAX_LESSONS);
+  activity("LEARNING ENGINE", row.title);
+  return row;
+}
+
+function deriveLearning(d) {
+  const L = ensureLearning();
+  const positions = Array.isArray(d.positions) ? d.positions : [];
+  const fills = Array.isArray(d.fills) ? d.fills : [];
+  const buys = fills.filter(f => String(f.side || "").toUpperCase() === "BUY");
+  const sells = fills.filter(f => String(f.side || "").toUpperCase() === "SELL");
+  const verifiedSells = sells.filter(f => f.routeVerified === true);
+  const zeroLiquidityBuys = buys.filter(f => {
+    const p = findPositionForFill(f, positions);
+    const liq = p?.entryContext?.snapshot?.liquidity;
+    return liq !== undefined && (!Number.isFinite(Number(liq)) || Number(liq) <= 0);
+  });
+  const unsellable = positions.filter(p => p.status === "unsellable");
+  const lockedCapitalLossUsd = unsellable.reduce((a,p)=>a+num(p.lockedCapitalLossUsd),0);
+  const endpointRows = Object.values(d.map || {});
+  const endpointCoverage = endpointRows.length ? Math.round(endpointRows.filter(x=>x?.ok).length / endpointRows.length * 100) : 0;
+  const verifiedSellRate = sells.length ? Math.round(verifiedSells.length / sells.length * 1000) / 10 : 100;
+
+  L.metrics = {
+    fillsObserved: fills.length,
+    buysObserved: buys.length,
+    sellsObserved: sells.length,
+    verifiedSells: verifiedSells.length,
+    verifiedSellRate,
+    zeroLiquidityBuys: zeroLiquidityBuys.length,
+    unsellablePositions: unsellable.length,
+    lockedCapitalLossUsd,
+    endpointCoverage,
+  };
+
+  const ledgerSig = hash(JSON.stringify([fills.length, buys.length, sells.length, verifiedSells.length, zeroLiquidityBuys.length, unsellable.length, Math.round(lockedCapitalLossUsd*100)]));
+  if (ledgerSig !== L.lastLedgerSignature) {
+    learn({
+      key:`LEDGER_SNAPSHOT:${ledgerSig}`,
+      kind:"LEDGER_SNAPSHOT",
+      title:`Council ledger learned: ${fills.length} fills observed`,
+      evidence:`${buys.length} BUY fills · ${sells.length} SELL fills · ${verifiedSells.length}/${sells.length || 0} SELL routes verified · ${zeroLiquidityBuys.length} zero-liquidity BUY records · ${unsellable.length} unsellable positions · ${money(lockedCapitalLossUsd)} locked-capital loss.`,
+      confidence:"measured",
+      source:"trade-log + positions"
+    });
+    L.lastLedgerSignature = ledgerSig;
+  }
+
+  if (d.proof?.reconciliation) {
+    const r=d.proof.reconciliation;
+    const sig=hash(JSON.stringify([num(r.reportedEquityUsd),num(r.independentlyReconstructedEquityUsd),num(r.equityDeltaUsd),r.accountingVerified]));
+    if(sig!==L.lastReconSignature){
+      const ok=Math.abs(num(r.equityDeltaUsd))<=0.01 && r.accountingVerified!==false;
+      learn({
+        key:`RECON:${sig}`,
+        kind:ok?"VERIFIED_ACCOUNTING":"ACCOUNTING_WEAKNESS",
+        title:ok?"Latest Council equity reconciles":"HIVE learned that reported equity does not reconcile",
+        evidence:`Reported ${money(r.reportedEquityUsd)} · independently reconstructed ${money(r.independentlyReconstructedEquityUsd)} · delta ${money(r.equityDeltaUsd)} · accountingVerified=${String(r.accountingVerified)}.`,
+        confidence:"verified",
+        source:"proof-cabinet"
+      });
+      L.lastReconSignature=sig;
+    }
+  }
+
+  if (zeroLiquidityBuys.length) {
+    learn({
+      key:"PATTERN:ZERO_LIQUIDITY_BUYS",
+      kind:"WEAK_POINT",
+      title:"Zero-liquidity entry protection has been bypassed in live records",
+      evidence:`HIVE currently sees ${zeroLiquidityBuys.length} BUY fill${zeroLiquidityBuys.length===1?"":"s"} whose recorded entry snapshot has zero or invalid liquidity. This is treated as an infrastructure weakness to trace, not a strategy change.`,
+      confidence:"verified",
+      source:"entry snapshots"
+    });
+  }
+
+  if (sells.length && verifiedSells.length < sells.length) {
+    learn({
+      key:"PATTERN:UNVERIFIED_SELLS",
+      kind:"WEAK_POINT",
+      title:"Not every credited SELL has independent route verification",
+      evidence:`Verified SELL coverage is ${verifiedSellRate.toFixed(1)}% (${verifiedSells.length}/${sells.length}). HIVE will trace any credited sale that lacks routeVerified=true so modeled proceeds cannot masquerade as verified cash.`,
+      confidence:"verified",
+      source:"trade-log"
+    });
+  }
+
+  if (unsellable.length) {
+    learn({
+      key:"PATTERN:UNSELLABLE_CAPITAL",
+      kind:"ACCOUNTING_LESSON",
+      title:"Unsellable capital is being tracked as a separate audit class",
+      evidence:`${unsellable.length} unsellable position${unsellable.length===1?" is":"s are"} currently visible with ${money(lockedCapitalLossUsd)} total locked-capital loss. HIVE checks that this cannot inflate realized profit or equity.`,
+      confidence:"measured",
+      source:"positions"
+    });
+  }
+
+  const currentIds = fills.map(f=>String(f.id||"")).filter(Boolean);
+  const seen = new Set(L.seenFillIds);
+  if (!L.initialized) {
+    L.seenFillIds = currentIds.slice(-1500);
+    L.initialized = true;
+    learn({
+      key:"BASELINE:LIVE_COUNCIL_CONNECTED",
+      kind:"BASELINE",
+      title:"Live Bot Council baseline captured",
+      evidence:`HIVE connected to ${endpointCoverage}% of configured read-only audit feeds and established a baseline of ${fills.length} fills and ${positions.length} positions. New changes will now be learned incrementally.`,
+      confidence:"measured",
+      source:"live-council"
+    });
+  } else {
+    const newFills = fills.filter(f=>f.id && !seen.has(String(f.id))).slice(-20);
+    for (const f of newFills) {
+      const p=findPositionForFill(f,positions);
+      const side=String(f.side||"").toUpperCase();
+      const route = side === "SELL" ? ` · route verified: ${String(f.routeVerified===true)}` : "";
+      learn({
+        key:`FILL:${f.id}`,
+        kind:"NEW_COUNCIL_EVENT",
+        title:`New Council ${side || "FILL"} observed: $${f.symbol || p?.symbol || "UNKNOWN"}`,
+        evidence:`Fill ${f.id} · ${money(f.filledUsd)}${route} · ${f.createdAt || "time unavailable"}.`,
+        confidence:"observed",
+        source:"trade-log"
+      });
+    }
+    L.seenFillIds = [...new Set([...L.seenFillIds, ...currentIds])].slice(-1500);
+  }
+}
+
+
+function baselineFingerprint() {
+  try { return fs.existsSync(BASELINE_ZIP) ? hash(fs.readFileSync(BASELINE_ZIP)).slice(0,16) : "baseline-unavailable"; }
+  catch { return "baseline-unavailable"; }
+}
+
+function promptIdFor(kind) { return `PROMPT-${String(kind).replace(/[^A-Z0-9_]/gi,"-")}`; }
+
+function buildUpdatePrompt(kind, findings) {
+  const profile = PROMPT_PROFILES[kind];
+  if (!profile || !findings.length) return null;
+  const distinctIncidents = findings.length;
+  const repeatedObservations = findings.reduce((n,f)=>n+num(f.count,1),0);
+  const firstSeen = findings.map(f=>new Date(f.detectedAt||0).getTime()).filter(Number.isFinite).sort((a,b)=>a-b)[0];
+  const lastSeen = findings.map(f=>new Date(f.lastSeenAt||f.detectedAt||0).getTime()).filter(Number.isFinite).sort((a,b)=>b-a)[0];
+  const evidence = findings.slice(0,12).map((f,i)=>`${i+1}. ${f.title}\n   ${f.evidence}\n   source=${f.source} · first=${f.detectedAt} · last=${f.lastSeenAt} · seen=${f.count||1}x`).join("\n");
+  const allowed = REPAIR_MAP[kind] || [];
+  const acceptance = profile.acceptance.map((x,i)=>`${i+1}. ${x}`).join("\n");
+  const tests = profile.tests.map((x,i)=>`${i+1}. ${x}`).join("\n");
+  const prompt = `UPDATE THE ATTACHED CURRENT BOT COUNCIL BUILD\n\nYou are updating the owner's CURRENT Bot Council package using a verified HIVE Auditor infrastructure finding. Treat the attached Council ZIP as the source of truth for the code you edit. The live deployment HIVE monitored is ${TARGET_URL}.\n\nHIVE AUDITOR FINDING\nKind: ${kind}\nRecommendation: ${profile.label}\nSeverity: ${findings[0].severity}\nDistinct live incidents currently open: ${distinctIncidents}\nRepeated scan observations: ${repeatedObservations}\nFirst observed: ${firstSeen ? new Date(firstSeen).toISOString() : "unknown"}\nLast observed: ${lastSeen ? new Date(lastSeen).toISOString() : "unknown"}\nAuditor baseline fingerprint: ${baselineFingerprint()}\n\nWHAT HIVE VERIFIED LIVE\n${evidence}\n\nHIVE'S CURRENT ROOT-CAUSE HYPOTHESIS\n${profile.suspectedRootCause}\n\nREQUIRED REPAIR\n${profile.goal}\n\nLIKELY INFRASTRUCTURE FILES TO INSPECT\n${allowed.length ? allowed.map(x=>`- ${x}`).join("\n") : "- Trace the relevant infrastructure path in the attached current build."}\n\nHARD STRATEGY LOCK — DO NOT CHANGE ANY OF THIS\n- Council votes or agent opinions\n- token selection or opportunity ranking\n- BUY / WATCH / SKIP decisions\n- entry thresholds or scoring\n- position sizing\n- take-profit targets\n- trailing logic\n- stop rules\n- exit strategy / reason for exiting\n- risk appetite\n- agent prompts or learned trading behavior\n\nThe purpose of this update is ONLY to repair infrastructure correctness, execution verification, accounting, persistence, idempotency, or state handling. A Council BUY/EXIT decision may remain exactly the same while the execution/accounting layer refuses to claim a fill or proceeds that cannot be verified.\n\nACCEPTANCE CRITERIA\n${acceptance}\n\nREGRESSION TESTS THAT MUST PASS\n${tests}\n\nIMPLEMENTATION REQUIREMENTS\n1. Inspect the attached current build before editing; do not assume HIVE's baseline is still identical to the current package.\n2. Trace the actual root cause in the current code and explain it before changing anything.\n3. Make the smallest safe fix that solves the verified infrastructure issue.\n4. Preserve all unrelated working functionality.\n5. Do not create fake paper profit, fake realized proceeds, or fake execution evidence.\n6. Add or update regression tests where possible.\n7. Verify the project still builds/parses and that protected trading behavior is unchanged for identical inputs.\n8. Return ONE clean downloadable Bot Council ZIP/folder as the new candidate base, plus a short changelog listing root cause, changed files, tests run, and results.\n9. Do not auto-deploy or connect private keys.\n\nIf the evidence points to a different technical root cause than HIVE's hypothesis, fix the proven root cause instead — but stay inside the hard strategy lock.`;
+  return {
+    id: promptIdFor(kind), kind, title: profile.label, severity: findings[0].severity,
+    distinctIncidents, repeatedObservations,
+    firstSeenAt: firstSeen ? new Date(firstSeen).toISOString() : null,
+    lastSeenAt: lastSeen ? new Date(lastSeen).toISOString() : null,
+    generatedAt: now(), baselineFingerprint: baselineFingerprint(), prompt,
+    evidencePreview: findings.slice(0,4).map(f=>f.evidence),
+    status: "ready"
+  };
+}
+
+function refreshUpdatePrompts() {
+  if (!Array.isArray(S.updatePrompts)) S.updatePrompts = [];
+  const groups = new Map();
+  for (const f of S.findings.filter(x=>x.status==="open" && PROMPT_PROFILES[x.kind])) {
+    if (!groups.has(f.kind)) groups.set(f.kind, []);
+    groups.get(f.kind).push(f);
+  }
+  const next=[];
+  for (const [kind, rows] of groups.entries()) {
+    rows.sort((a,b)=>severityRank[b.severity]-severityRank[a.severity] || new Date(b.lastSeenAt)-new Date(a.lastSeenAt));
+    const built=buildUpdatePrompt(kind,rows);
+    if (built) next.push(built);
+  }
+  next.sort((a,b)=>severityRank[b.severity]-severityRank[a.severity] || b.distinctIncidents-a.distinctIncidents || new Date(b.lastSeenAt)-new Date(a.lastSeenAt));
+  S.updatePrompts=next.slice(0,MAX_PROMPTS);
 }
 
 const severityRank = { info: 0, low: 1, medium: 2, high: 3, critical: 4 };
@@ -448,6 +762,8 @@ async function scan() {
     S.lastScanAt=now();
     S.targetOnline=Object.values(data.map).some(x=>x.ok);
     auditLiveData(data);
+    deriveLearning(data);
+    refreshUpdatePrompts();
     const wallet=data.wallet||{};
     S.lastSnapshot={
       at:now(), cashUsd:num(wallet.cashUsd), equityUsd:num(wallet.equityUsd), totalPnlUsd:num(wallet.totalPnlUsd),
@@ -473,6 +789,7 @@ function stateForClient() {
     configuredBrains:configuredBrains().map(x=>({name:x.name,configured:Boolean(x.key),model:x.model})),
     dataPersistent:DATA_DIR.startsWith("/data/"),
     autoRepair:AUTO_REPAIR,
+    updatePromptCount:Array.isArray(S.updatePrompts)?S.updatePrompts.length:0,
     strategyLock:{active:true,protectedFiles:PROTECTED_FILES},
   };
 }
@@ -481,24 +798,46 @@ function html() {
   const open=S.findings.filter(f=>f.status==="open");
   const critical=open.filter(f=>f.severity==="critical");
   const ready=S.updates.filter(u=>u.status==="ready");
+  const prompts=Array.isArray(S.updatePrompts)?S.updatePrompts.filter(x=>x.status==="ready"):[];
   const snap=S.lastSnapshot||{};
+  const L=ensureLearning();
+  const m=L.metrics||{};
   const endpoints=Object.entries(S.endpoints).map(([k,v])=>`<div class="mini"><span>${esc(k)}</span><b class="${v.ok?"good":"bad"}">${v.ok?"LIVE":"DOWN"}</b><small>${v.ok?`${v.ms} ms`:esc(v.error||"error")}</small></div>`).join("");
-  const findings=open.slice(0,35).map(f=>`<article class="finding ${esc(f.severity)}"><div class="row"><b>${esc(f.severity.toUpperCase())} · ${esc(f.title)}</b><span>${esc(f.source)}</span></div><p>${esc(f.evidence)}</p><small>Seen ${f.count||1}× · first ${esc(f.detectedAt)} · repair: ${esc(f.repairStatus||"not_started")}${f.updateId?` · ${esc(f.updateId)}`:""}</small></article>`).join("")||`<div class="empty">No open findings yet. HIVE is watching the live Council.</div>`;
+  const findings=open.slice(0,28).map(f=>`<article class="finding ${esc(f.severity)}"><div class="row"><b>${esc(f.severity.toUpperCase())} · ${esc(f.title)}</b><span>${esc(f.source)}</span></div><p>${esc(f.evidence)}</p><small>Seen ${f.count||1}× · first ${esc(f.detectedAt)} · repair: ${esc(f.repairStatus||"not_started")}${f.updateId?` · ${esc(f.updateId)}`:""}</small></article>`).join("")||`<div class="empty">No open findings yet. HIVE is watching the live Council.</div>`;
   const updates=ready.slice(0,10).map(u=>`<article class="update"><div><b>${esc(u.id)}</b><p>${esc(u.summary)}</p><small>${esc(u.changedFiles.join(", "))} · ${esc(u.provider)}/${esc(u.model)}</small></div><a href="/download/${encodeURIComponent(u.id)}">DOWNLOAD UPDATE</a></article>`).join("")||`<div class="empty">No downloadable repair package is ready yet.</div>`;
+  const promptCards=prompts.slice(0,10).map(p=>`<article class="prompt-card"><div class="prompt-main"><div class="prompt-top"><b>${esc(p.severity.toUpperCase())} · ${esc(p.title)}</b><span>${p.distinctIncidents} LIVE INCIDENT${p.distinctIncidents===1?"":"S"}</span></div><p>${esc(p.evidencePreview?.[0]||"")}</p><small>${esc(p.kind)} · generated ${esc(new Date(p.generatedAt).toLocaleString())} · baseline ${esc(p.baselineFingerprint)}</small></div><div class="prompt-actions"><button onclick="copyPrompt('${encodeURIComponent(p.id)}',this)">COPY PROMPT</button><a href="/prompt/${encodeURIComponent(p.id)}?download=1">DOWNLOAD .TXT</a></div></article>`).join("")||`<div class="empty">No update prompt is ready yet. HIVE creates one automatically when a repairable live weakness is verified.</div>`;
+
   const brains=configuredBrains().map(b=>`<div class="mini"><span>${esc(b.name.toUpperCase())}</span><b class="${b.key?"good":"muted"}">${b.key?"READY":"OPTIONAL"}</b><small>${esc(b.model)}</small></div>`).join("");
-  const acts=S.activity.slice(0,25).map(a=>`<div class="act"><time>${esc(new Date(a.at).toLocaleString())}</time><b>${esc(a.agent)}</b><span>${esc(a.text)}</span></div>`).join("");
-  return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>HIVE AUDITOR</title><style>
-  *{box-sizing:border-box}body{margin:0;background:#050505;color:#f5f5f5;font-family:Inter,system-ui,-apple-system,sans-serif}.wrap{max-width:1180px;margin:auto;padding:18px}.hero{border:1px solid #252525;background:#0b0b0b;border-radius:22px;padding:24px;margin-bottom:14px}.eyebrow{font-size:11px;letter-spacing:.2em;color:#9b9b9b}.hero h1{margin:7px 0 3px;font-size:32px}.live{font-size:12px;color:${S.targetOnline?"#53f0a7":"#ff6b6b"}}.hero p{color:#aaa;max-width:780px;line-height:1.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:12px 0}.card,.sec{background:#0b0b0b;border:1px solid #222;border-radius:16px;padding:16px}.card span,.mini span,.card small,.mini small{display:block;color:#888;font-size:11px}.card b{font-size:25px;display:block;margin:4px 0}.sec{margin:12px 0}.sec h2{font-size:15px;letter-spacing:.08em;margin:0 0 12px}.mini-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.mini{border:1px solid #222;border-radius:12px;padding:10px;min-width:0}.mini b{display:block;font-size:12px;margin:5px 0}.mini small{overflow:hidden;text-overflow:ellipsis}.good{color:#53f0a7}.bad{color:#ff6b6b}.muted{color:#777}.lock{border:1px solid #23523f;background:#08150f}.lock b{color:#53f0a7}.finding{border:1px solid #252525;border-left-width:4px;border-radius:12px;padding:12px;margin:8px 0;background:#080808}.finding.critical{border-left-color:#ff4d4f}.finding.high{border-left-color:#ff9f43}.finding.medium{border-left-color:#ffd166}.finding p{color:#bbb;font-size:13px;line-height:1.45}.finding small{color:#777}.row{display:flex;justify-content:space-between;gap:12px}.row span{font-size:11px;color:#777}.update{display:flex;justify-content:space-between;gap:12px;align-items:center;border:1px solid #23523f;border-radius:12px;padding:13px;margin:8px 0;background:#07110c}.update p{margin:5px 0;color:#bbb}.update small{color:#777}.update a{background:#f5f5f5;color:#050505;text-decoration:none;padding:10px 13px;border-radius:10px;font-size:11px;font-weight:800;white-space:nowrap}.act{display:grid;grid-template-columns:150px 115px 1fr;gap:10px;border-bottom:1px solid #171717;padding:8px 0;font-size:12px}.act time{color:#666}.act b{color:#aaa}.act span{color:#ddd}.empty{color:#777;padding:16px;border:1px dashed #252525;border-radius:12px}.priority{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.priority div{border:1px solid #242424;border-radius:12px;padding:11px}.priority b{display:block;font-size:12px}.priority span{display:block;color:#8b8b8b;font-size:11px;margin-top:5px;line-height:1.35}@media(max-width:800px){.grid,.mini-grid,.priority{grid-template-columns:repeat(2,1fr)}.act{grid-template-columns:1fr}.row{display:block}.update{display:block}.update a{display:inline-block;margin-top:10px}}@media(max-width:470px){.grid{grid-template-columns:1fr 1fr}.mini-grid,.priority{grid-template-columns:1fr}.hero h1{font-size:27px}}
-  </style></head><body><main class="wrap"><section class="hero"><div class="eyebrow">INDEPENDENT SYSTEMS AUDITOR · NO TRADING AUTHORITY</div><h1>HIVE AUDITOR <span class="live">● ${S.targetOnline?"MONITORING LIVE":"WAITING FOR LIVE FEED"}</span></h1><p>HIVE watches the Bot Council's live accounting, liquidity evidence, sell verification, persistence and background infrastructure. It may diagnose, code, test and package repairs. It cannot rewrite the Council's trading strategy or auto-deploy updates.</p><small>${esc(TARGET_URL)}</small></section>
-  <section class="grid"><div class="card"><span>SCANS</span><b>${S.scans}</b><small>${esc(S.lastScanAt||"starting")}</small></div><div class="card"><span>OPEN FINDINGS</span><b>${open.length}</b><small>${critical.length} critical</small></div><div class="card"><span>LAST EQUITY</span><b>${money(snap.equityUsd)}</b><small>P/L ${money(snap.totalPnlUsd)}</small></div><div class="card"><span>UPDATES READY</span><b>${ready.length}</b><small>owner approval required</small></div></section>
-  <section class="sec lock"><h2>STRATEGY LOCK · ACTIVE</h2><b>Trading decisions are off limits.</b><p>HIVE cannot change Council votes, BUY/WATCH/SKIP logic, sizing, entry score thresholds, take-profit targets, trailing rules, stop rules, risk appetite or learned trading strategy. Repairs are restricted to correctness and infrastructure.</p></section>
-  <section class="sec"><h2>PRIORITY WATCH</h2><div class="priority"><div><b>ZERO-LIQUIDITY ENTRIES</b><span>Verify the exact entry pool and whether a PAPER buy was recorded without trustworthy executable liquidity.</span></div><div><b>FALSE / UNVERIFIED SALES</b><span>Never treat modeled proceeds as verified cash when no executable sell route was proven.</span></div><div><b>ACCOUNTING RECONCILIATION</b><span>Rebuild equity from cash + open marked positions and challenge every mismatch.</span></div><div><b>UNSELLABLE CAPITAL</b><span>Confirm locked capital is counted as loss and cannot masquerade as realized profit.</span></div></div></section>
-  <section class="sec"><h2>LIVE AUDIT FEEDS</h2><div class="mini-grid">${endpoints}</div></section>
-  <section class="sec"><h2>REPAIR BRAINS · OPTIONAL FOR MONITORING</h2><div class="mini-grid">${brains}</div><p style="color:#777;font-size:12px">Monitoring and deterministic audits do not require an AI API. A configured brain is only used when HIVE needs to develop a new code repair.</p></section>
-  <section class="sec"><h2>OPEN FINDINGS</h2>${findings}</section>
-  <section class="sec"><h2>UPDATE CENTER</h2>${updates}</section>
-  <section class="sec"><h2>HIVE ACTIVITY</h2>${acts}</section>
-  </main><script>setTimeout(()=>location.reload(),15000)</script></body></html>`;
+  const acts=S.activity.slice(0,22).map(a=>`<div class="act"><time>${esc(new Date(a.at).toLocaleString())}</time><b>${esc(a.agent)}</b><span>${esc(a.text)}</span></div>`).join("");
+  const lessons=L.lessons.slice(0,18).map((x,i)=>`<article class="lesson"><div class="lesson-num">${String(i+1).padStart(2,"0")}</div><div><div class="lesson-head"><b>${esc(x.title)}</b><span>${esc(String(x.confidence||"observed").toUpperCase())}</span></div><p>${esc(x.evidence)}</p><small>${esc(x.source)} · learned ${esc(new Date(x.firstSeenAt).toLocaleString())}${x.count>1?` · reconfirmed ${x.count}×`:""}</small></div></article>`).join("")||`<div class="empty">HIVE is connected and waiting for enough live Council evidence to form its first learning record.</div>`;
+  const studies=[
+    ["01","ZERO-LIQUIDITY BUY PATH","Trace exactly where recorded liquidity becomes zero/invalid and why the infrastructure still permits a PAPER fill."],
+    ["02","SELL PROOF VS. MODELED PROCEEDS","Separate an actual verified exit route from a price model so fake PAPER cash cannot be credited."],
+    ["03","EQUITY RECONCILIATION","Rebuild cash + marked open value − locked capital independently and compare it with every reported total."],
+    ["04","UNSELLABLE STATE","Verify that blocked exits become losses/locked capital and never remain positive marked profit."],
+  ].map(x=>`<div class="study"><span>${x[0]}</span><b>${x[1]}</b><p>${x[2]}</p></div>`).join("");
+  const verifiedRate=Number.isFinite(Number(m.verifiedSellRate))?Number(m.verifiedSellRate):0;
+  return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>HIVE AUDITOR</title><style>
+  *{box-sizing:border-box}html{background:#030303}body{margin:0;background:#030303;color:#f4f4f2;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1240px;margin:auto;padding:22px 20px 48px}.top{display:flex;justify-content:space-between;align-items:center;padding:3px 1px 18px}.brand{font-weight:900;letter-spacing:.16em;font-size:15px}.pill{border:1px solid #2b2b2b;border-radius:999px;padding:7px 10px;font-size:10px;letter-spacing:.08em}.pill.live{color:#69efae}.pill.off{color:#ff7777}.hero{padding:34px 0 22px;border-top:1px solid #151515}.hero .kicker{font-size:11px;color:#808080;letter-spacing:.2em}.hero h1{font-size:clamp(42px,7vw,78px);letter-spacing:-.055em;line-height:.88;margin:15px 0 18px;max-width:880px}.hero h1 em{font-style:normal;color:#8a8a8a}.hero p{color:#999;max-width:790px;font-size:15px;line-height:1.55;margin:0}.target{margin-top:18px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:#777}.metric-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin:22px 0}.metric{border:1px solid #202020;background:#080808;border-radius:14px;padding:14px;min-height:90px}.metric span{display:block;color:#6f6f6f;font-size:10px;letter-spacing:.08em}.metric b{display:block;font-size:24px;margin:8px 0 3px;letter-spacing:-.04em}.metric small{color:#777;font-size:10px}.sec{border-top:1px solid #191919;padding:27px 0}.sec-title{display:flex;justify-content:space-between;gap:12px;align-items:end;margin-bottom:14px}.sec h2{margin:0;font-size:18px;letter-spacing:-.02em}.sec-title p{margin:0;color:#666;font-size:11px;text-align:right}.learning-banner{border:1px solid #223e31;background:#07110c;border-radius:16px;padding:15px 16px;margin-bottom:12px;color:#a7d7bd;font-size:12px;line-height:1.5}.lesson{display:grid;grid-template-columns:42px 1fr;gap:12px;border-bottom:1px solid #151515;padding:14px 0}.lesson-num{color:#494949;font:700 11px ui-monospace,monospace;padding-top:3px}.lesson-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.lesson-head b{font-size:13px}.lesson-head span{font-size:9px;letter-spacing:.1em;color:#70dca4;border:1px solid #24523b;border-radius:999px;padding:4px 6px}.lesson p{color:#a6a6a6;font-size:12px;line-height:1.5;margin:6px 0}.lesson small{color:#595959;font-size:10px}.study-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.study{border:1px solid #1f1f1f;background:#070707;border-radius:14px;padding:14px}.study span{color:#505050;font:700 10px ui-monospace,monospace}.study b{display:block;margin:14px 0 6px;font-size:11px;letter-spacing:.04em}.study p{color:#777;font-size:11px;line-height:1.45;margin:0}.mini-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.mini{border:1px solid #1f1f1f;border-radius:12px;padding:11px;min-width:0}.mini span,.mini small{display:block;color:#686868;font-size:10px}.mini b{display:block;font-size:11px;margin:6px 0}.good{color:#65e9a6}.bad{color:#ff7272}.muted{color:#666}.lock{border:1px solid #223e31;background:#06100b;border-radius:14px;padding:14px}.lock b{color:#66e8a6;font-size:12px}.lock p{color:#789285;font-size:11px;line-height:1.5;margin:6px 0 0}.finding{border:1px solid #1d1d1d;border-left-width:3px;border-radius:11px;padding:12px;margin:7px 0;background:#060606}.finding.critical{border-left-color:#ff5558}.finding.high{border-left-color:#f6a648}.finding.medium{border-left-color:#e8cc6a}.finding p{color:#999;font-size:11px;line-height:1.5}.finding small{color:#555;font-size:10px}.row{display:flex;justify-content:space-between;gap:12px}.row b{font-size:11px}.row span{font-size:9px;color:#5e5e5e}.update{display:flex;justify-content:space-between;gap:12px;align-items:center;border:1px solid #244635;border-radius:12px;padding:13px;margin:7px 0;background:#06100b}.update p{margin:5px 0;color:#999;font-size:11px}.update small{color:#5f6f66;font-size:9px}.update a{background:#f1f1ed;color:#050505;text-decoration:none;padding:10px 13px;border-radius:9px;font-size:10px;font-weight:900;white-space:nowrap}.prompt-card{display:flex;justify-content:space-between;gap:14px;align-items:center;border:1px solid #3b2f1b;border-radius:12px;padding:14px;margin:8px 0;background:#100b04}.prompt-main{min-width:0}.prompt-top{display:flex;justify-content:space-between;gap:12px;align-items:center}.prompt-top b{font-size:12px}.prompt-top span{font-size:9px;letter-spacing:.08em;color:#ffc766;border:1px solid #59411f;border-radius:999px;padding:4px 7px;white-space:nowrap}.prompt-card p{margin:7px 0;color:#aaa;font-size:11px;line-height:1.45}.prompt-card small{color:#6c604c;font-size:9px}.prompt-actions{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.prompt-actions button,.prompt-actions a{border:0;background:#f1f1ed;color:#050505;text-decoration:none;padding:10px 12px;border-radius:9px;font-size:10px;font-weight:900;white-space:nowrap;cursor:pointer}.prompt-actions a{background:#211a10;color:#f2d99b;border:1px solid #4b3b21}.act{display:grid;grid-template-columns:145px 115px 1fr;gap:10px;border-bottom:1px solid #121212;padding:8px 0;font-size:10px}.act time{color:#4e4e4e}.act b{color:#777}.act span{color:#aaa}.empty{color:#606060;padding:15px;border:1px dashed #202020;border-radius:11px;font-size:11px}.two{display:grid;grid-template-columns:1.2fr .8fr;gap:18px}@media(max-width:950px){.metric-grid{grid-template-columns:repeat(3,1fr)}.study-grid{grid-template-columns:repeat(2,1fr)}.two{grid-template-columns:1fr}.mini-grid{grid-template-columns:repeat(3,1fr)}}@media(max-width:620px){.wrap{padding:16px 14px 38px}.metric-grid{grid-template-columns:repeat(2,1fr)}.study-grid,.mini-grid{grid-template-columns:1fr 1fr}.hero h1{font-size:48px}.sec-title{display:block}.sec-title p{text-align:left;margin-top:5px}.act{grid-template-columns:1fr}.row{display:block}.update{display:block}.update a{display:inline-block;margin-top:10px}.prompt-card{display:block}.prompt-actions{justify-content:flex-start;margin-top:10px}.prompt-top{display:block}.prompt-top span{display:inline-block;margin-top:7px}}@media(max-width:420px){.study-grid,.mini-grid{grid-template-columns:1fr}.hero h1{font-size:43px}}
+  </style></head><body><main class="wrap"><header class="top"><div class="brand">HIVE AUDITOR</div><div class="pill ${S.targetOnline?"live":"off"}">● ${S.targetOnline?"LEARNING LIVE":"WAITING FOR COUNCIL"}</div></header>
+  <section class="hero"><div class="kicker">INDEPENDENT AUDITOR · REPAIR ENGINEER · NO TRADING AUTHORITY</div><h1>WATCH THE COUNCIL.<br><em>LEARN WHAT BREAKS.</em></h1><p>HIVE continuously reads the live Bot Council, learns how its accounting and execution infrastructure behave, verifies weak points, traces root causes, and packages technical repairs without changing a single trading decision.</p><div class="target">LIVE SOURCE · ${esc(TARGET_URL)}</div></section>
+  <section class="metric-grid"><div class="metric"><span>LIVE SCANS</span><b>${S.scans}</b><small>${esc(S.lastScanAt||"starting")}</small></div><div class="metric"><span>FILLS LEARNED</span><b>${num(m.fillsObserved)}</b><small>${num(m.buysObserved)} buys · ${num(m.sellsObserved)} sells</small></div><div class="metric"><span>SELL PROOF RATE</span><b>${verifiedRate.toFixed(1)}%</b><small>${num(m.verifiedSells)}/${num(m.sellsObserved)} verified</small></div><div class="metric"><span>OPEN FINDINGS</span><b>${open.length}</b><small>${critical.length} critical</small></div><div class="metric"><span>LESSONS FILED</span><b>${L.lessons.length}</b><small>persistent audit memory</small></div><div class="metric"><span>UPDATE PROMPTS</span><b>${prompts.length}</b><small>copy-ready for current build</small></div></section>
+  <section class="sec"><div class="sec-title"><div><h2>WHAT HIVE IS LEARNING FROM BOT COUNCIL</h2></div><p>Evidence from live trades, positions, reconciliation and proof feeds.</p></div><div class="learning-banner">HIVE does not learn trading strategy here. It learns whether the infrastructure underneath the Council is truthful: whether BUY liquidity was real, SELL proceeds were verifiable, equity reconciles, and unsellable capital is accounted for correctly.</div>${lessons}</section>
+  <section class="sec"><div class="sec-title"><h2>WHAT HIVE IS STUDYING RIGHT NOW</h2><p>Current audit mission.</p></div><div class="study-grid">${studies}</div></section>
+  <section class="sec"><div class="lock"><b>STRATEGY LOCK · ACTIVE</b><p>HIVE cannot alter Council votes, token selection, BUY/WATCH/SKIP logic, entry thresholds, sizing, profit targets, trailing logic, stop rules, risk appetite, agent prompts or learned trading strategy. Any repair that changes those areas fails the guard.</p></div></section>
+  <div class="two"><div><section class="sec"><div class="sec-title"><h2>VERIFIED WEAK POINTS</h2><p>Problems HIVE can prove.</p></div>${findings}</section><section class="sec"><div class="sec-title"><h2>UPDATE PROMPTS</h2><p>HIVE turns verified live weaknesses into copy-ready repair instructions for the current Council build.</p></div><div class="learning-banner">Use <b>COPY PROMPT</b>, attach your latest Bot Council ZIP, and paste the prompt into ChatGPT. HIVE includes live evidence, suspected root cause, protected trading boundaries, acceptance criteria, and regression tests.</div>${promptCards}</section><section class="sec"><div class="sec-title"><h2>UPDATE CENTER</h2><p>Optional AI-built candidate repair packages.</p></div>${updates}</section></div><div><section class="sec"><div class="sec-title"><h2>LIVE COUNCIL FEEDS</h2><p>${num(m.endpointCoverage)}% coverage</p></div><div class="mini-grid">${endpoints}</div></section><section class="sec"><div class="sec-title"><h2>REPAIR BRAINS</h2><p>Optional for code generation.</p></div><div class="mini-grid">${brains}</div></section></div></div>
+  <section class="sec"><div class="sec-title"><h2>HIVE ACTIVITY</h2><p>Audit and learning events.</p></div>${acts}</section>
+  </main><script>
+  async function copyPrompt(id,btn){
+    try{
+      const r=await fetch('/api/prompt/'+id,{cache:'no-store'}); const j=await r.json();
+      if(!r.ok||!j.prompt) throw new Error(j.error||'prompt unavailable');
+      await navigator.clipboard.writeText(j.prompt);
+      const old=btn.textContent; btn.textContent='COPIED'; setTimeout(()=>btn.textContent=old,1800);
+    }catch(e){ alert('Could not copy prompt: '+e.message); }
+  }
+  setTimeout(()=>location.reload(),15000)
+  </script></body></html>`;
 }
 
 function json(res, code, body) { const b=JSON.stringify(body); res.writeHead(code,{"content-type":"application/json","cache-control":"no-store","content-length":Buffer.byteLength(b)}); res.end(b); }
@@ -508,7 +847,23 @@ const server=http.createServer(async(req,res)=>{
     const u=new URL(req.url,`http://${req.headers.host||"localhost"}`);
     if(u.pathname==="/"){ const b=html(); res.writeHead(200,{"content-type":"text/html; charset=utf-8","cache-control":"no-store"}); return res.end(b); }
     if(u.pathname==="/api/state") return json(res,200,stateForClient());
+    if(u.pathname==="/api/learning") { const L=ensureLearning(); return json(res,200,{ok:true,metrics:L.metrics,lessons:L.lessons,lastScanAt:S.lastScanAt,targetOnline:S.targetOnline}); }
     if(u.pathname==="/api/scan" && (req.method==="POST"||req.method==="GET")){ await scan(); return json(res,200,{ok:true,scans:S.scans,lastScanAt:S.lastScanAt}); }
+    if(u.pathname.startsWith("/api/prompt/")) {
+      const id=decodeURIComponent(u.pathname.slice("/api/prompt/".length));
+      const row=(S.updatePrompts||[]).find(x=>x.id===id&&x.status==="ready");
+      if(!row) return json(res,404,{error:"Prompt not found"});
+      return json(res,200,{ok:true,id:row.id,kind:row.kind,title:row.title,generatedAt:row.generatedAt,prompt:row.prompt});
+    }
+    if(u.pathname.startsWith("/prompt/")) {
+      const id=decodeURIComponent(u.pathname.slice("/prompt/".length));
+      const row=(S.updatePrompts||[]).find(x=>x.id===id&&x.status==="ready");
+      if(!row){res.writeHead(404);return res.end("Prompt not found");}
+      const body=row.prompt;
+      const headers={"content-type":"text/plain; charset=utf-8","cache-control":"no-store"};
+      if(u.searchParams.get("download")==="1") headers["content-disposition"]=`attachment; filename="${row.id}.txt"`;
+      res.writeHead(200,headers);return res.end(body);
+    }
     if(u.pathname.startsWith("/download/")){
       const id=decodeURIComponent(u.pathname.slice("/download/".length)); const row=S.updates.find(x=>x.id===id&&x.status==="ready");
       if(!row||!row.path||!fs.existsSync(row.path)){res.writeHead(404);return res.end("Update not found");}
@@ -524,17 +879,24 @@ function selfTest() {
   const old=S; S=freshState();
   const fixture={map:{autopilot:{ok:true}},wallet:{storage:"redis"},proof:{reconciliation:{reportedEquityUsd:1700,independentlyReconstructedEquityUsd:1695,equityDeltaUsd:5,accountingVerified:false}},positions:[{id:"P1",symbol:"ZERO",chain:"Solana",tokenAddress:"T1",status:"unsellable",entryNotionalUsd:100,realizedCostUsd:0,lockedCapitalLossUsd:50,markPrice:2,entryContext:{snapshot:{liquidity:0,dataProvenance:{notes:[]}}},unsellableAt:"2026-01-01T00:00:00Z",updatedAt:"2026-01-01T00:00:00Z"}],fills:[{id:"B1",positionId:"P1",side:"BUY",symbol:"ZERO",filledUsd:100,createdAt:"2026-01-01T00:00:00Z"},{id:"S1",positionId:"P1",side:"SELL",symbol:"ZERO",filledUsd:80,routeVerified:false,routeProvider:"liquidity-model",createdAt:"2026-01-01T00:01:00Z"}]};
   auditLiveData(fixture);
+  deriveLearning(fixture);
+  refreshUpdatePrompts();
   const kinds=new Set(S.findings.map(x=>x.kind));
   const need=["ACCOUNTING_MISMATCH","ZERO_LIQUIDITY_BUY","UNVERIFIED_SELL_CREDIT","UNSELLABLE_ACCOUNTING"];
   const missing=need.filter(x=>!kinds.has(x));
+  const lessonCount=S.learning?.lessons?.length||0;
+  const sellPrompt=(S.updatePrompts||[]).find(x=>x.kind==="UNVERIFIED_SELL_CREDIT");
+  const promptOk=Boolean(sellPrompt && /CURRENT Bot Council package/i.test(sellPrompt.prompt) && /routeVerified/i.test(sellPrompt.prompt) && /DO NOT CHANGE/i.test(sellPrompt.prompt));
   S=old;
   if(missing.length) { console.error("SELF TEST FAIL",missing); process.exit(1); }
-  console.log("HIVE AUDITOR SELF TEST: PASS",need.join(", ")); process.exit(0);
+  if(!lessonCount) { console.error("SELF TEST FAIL: learning engine produced no lessons"); process.exit(1); }
+  if(!promptOk) { console.error("SELF TEST FAIL: update prompt engine did not create a protected UNVERIFIED_SELL_CREDIT prompt"); process.exit(1); }
+  console.log("HIVE AUDITOR SELF TEST: PASS",need.join(", "),"| learning lessons:",lessonCount,"| update prompt: PASS"); process.exit(0);
 }
 
 if(process.argv.includes("--self-test")) selfTest();
 server.listen(PORT,()=>{
-  console.log(`HIVE AUDITOR V1 listening on ${PORT}`);
+  console.log(`HIVE AUDITOR V1.2 listening on ${PORT}`);
   console.log(`Target Council: ${TARGET_URL}`);
   if(!S.staticAuditComplete) baselineStaticAudit();
   scan();

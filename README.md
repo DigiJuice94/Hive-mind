@@ -1,6 +1,6 @@
-# HIVE AUDITOR V1
+# HIVE AUDITOR V1.2
 
-This is the full pivot of HIVE. It is no longer a money-making bot and it is not a trading Council seat.
+This version adds the Update Prompt Engine on top of the live learning dashboard. HIVE is no longer a money-making bot and it is not a trading Council seat.
 
 ## Mission
 
@@ -83,3 +83,50 @@ The built-in self-test verifies that HIVE catches an equity mismatch, a zero-liq
 ## Update behavior
 
 When HIVE has a verified repair and its guards pass, the dashboard shows **UPDATE READY** with a download button. HIVE does not silently modify the live Council. The owner decides when to deploy the package.
+
+
+## V1.1 live learning dashboard
+
+The homepage now visibly shows what HIVE is learning from the live Bot Council instead of the old HIVE ZERO "Learn to do the work" screen.
+
+HIVE files persistent audit lessons from:
+
+- newly observed Council fills
+- BUY-side entry-liquidity evidence
+- SELL route-verification coverage
+- proof-cabinet equity reconciliation
+- unsellable positions and locked-capital loss
+- live endpoint coverage and state changes
+
+The dashboard separates **learning** from **trading strategy**. These lessons are about system truthfulness and infrastructure correctness only. A new read-only endpoint is available at `/api/learning`.
+
+
+## V1.2 Update Prompt Engine
+
+HIVE now converts verified live infrastructure weaknesses into copy-ready prompts for repairing the **current** Bot Council build.
+
+This does **not** require an AI key. The prompt is generated deterministically from HIVE's own live findings and includes:
+
+- finding type and severity
+- distinct live incidents and repeated observations
+- concrete fill/position evidence from the live Council
+- HIVE's current root-cause hypothesis
+- likely infrastructure files to inspect
+- a hard strategy lock stating what must not change
+- required repair behavior
+- acceptance criteria
+- regression tests
+- instructions to use the user's attached **current Bot Council ZIP** as source of truth
+- instructions to return one clean downloadable updated Council package
+
+The dashboard now has an **UPDATE PROMPTS** section with **COPY PROMPT** and **DOWNLOAD .TXT** controls.
+
+A key example is `UNVERIFIED_SELL_CREDIT`. When HIVE sees recurring SELL fills where `filledUsd > 0` but `routeVerified !== true`, it generates a prompt specifically requiring the current Council build to stop modeled/unverified exits from becoming realized cash while preserving the Council's original EXIT decision and all trading strategy.
+
+Read-only endpoints:
+
+- `/api/prompt/<PROMPT_ID>` returns the generated prompt as JSON.
+- `/prompt/<PROMPT_ID>` returns plain text.
+- `/prompt/<PROMPT_ID>?download=1` downloads the prompt as a `.txt` file.
+
+The existing optional Repair Engine remains available, but the Update Prompt Engine is designed for the owner's preferred workflow: **HIVE audits live -> HIVE verifies a recurring weakness -> HIVE prepares a precise prompt -> owner attaches the latest Council ZIP and gives that prompt to ChatGPT -> ChatGPT creates the candidate update.**

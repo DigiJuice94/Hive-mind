@@ -1,8 +1,8 @@
 {
-  "name": "hive-auditor-v1",
-  "version": "1.0.0",
+  "name": "hive-auditor-v1-2",
+  "version": "1.2.0",
   "private": true,
-  "description": "Independent live auditor and repair engineer for Bot Council infrastructure.",
+  "description": "Independent live Bot Council auditor with learning, verified findings, and copy-ready update prompt generation.",
   "scripts": {
     "start": "node server.js",
     "test": "node server.js --self-test"
